@@ -82,12 +82,10 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
     def stop_consuming(self):
         """Detiene el consumo de mensajes. Si no se está consumiendo, no hace nada."""
         try:
-            if self._channel and self._channel.is_open:
-                if self.consumer_tag:
-                    self._channel.basic_cancel(self.consumer_tag)
-                    self.consumer_tag = None
-                if self._channel.is_consuming:
-                    self._channel.stop_consuming()
+            if self._channel and self._channel.is_open and self.consumer_tag:
+                self._channel.basic_cancel(self.consumer_tag)
+                self.consumer_tag = None
+                self._channel.stop_consuming()
         except AMQPConnectionError:
             raise MessageMiddlewareDisconnectedError(
                 "Se perdió la conexión con RabbitMQ al intentar detener el consumo de mensajes."
@@ -130,3 +128,78 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             raise MessageMiddlewareDisconnectedError from e
         except AMQPError as e:
             raise MessageMiddlewareMessageError from e
+
+    def send(self, message):
+        """Envía un mensaje al exchange con la routing key configurada."""
+        try:
+            self._channel.basic_publish(
+                exchange=self.exchange_name,
+                routing_key=self.routing_keys[0],
+                body=message,
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent
+                ),
+            )
+        except AMQPConnectionError:
+            raise MessageMiddlewareDisconnectedError(
+                "Se perdio la conexion al intentar publicar en el exchange"
+            )
+        except AMQPError as e:
+            raise MessageMiddlewareMessageError from e
+
+    def start_consuming(self, on_message_callback):
+        """Inicia el consumo de mensajes del exchange. Se crea una cola anónima
+        y exclusiva para este consumidor, y se vincula a las routing keys configuradas.
+        """
+        try:
+            # Cola anónima y exclusiva para el suscriptor
+            res = self._channel.queue_declare(queue="", exclusive=True)
+            queue_name = res.method.queue
+
+            # Vincular la cola a las routing keys
+            for rkey in self.routing_keys:
+                self._channel.queue_bind(
+                    exchange=self.exchange_name,
+                    queue=queue_name,
+                    routing_key=rkey,
+                )
+
+            def _wrapper(ch, method, properties, body):
+                ack = lambda: ch.basic_ack(delivery_tag=method.delivery_tag)
+                nack = lambda: ch.basic_nack(delivery_tag=method.delivery_tag)
+                on_message_callback(body, ack, nack)
+
+            self.consumer_tag = self._channel.basic_consume(
+                queue=queue_name,
+                on_message_callback=_wrapper,
+                auto_ack=False,
+            )
+            self._channel.start_consuming()
+        except AMQPConnectionError as e:
+            raise MessageMiddlewareDisconnectedError from e
+        except AMQPError as e:
+            raise MessageMiddlewareMessageError from e
+
+    def stop_consuming(self):
+        """Detiene el consumo de mensajes. Si no se está consumiendo, no hace nada."""
+        try:
+            if self._channel and self._channel.is_open and self.consumer_tag:
+                self._channel.basic_cancel(self.consumer_tag)
+                self.consumer_tag = None
+                self._channel.stop_consuming()
+        except AMQPConnectionError as e:
+            raise MessageMiddlewareDisconnectedError from e
+        except AMQPError:
+            pass
+
+    def close(self):
+        """Cierra la conexión y el canal de comunicación con RabbitMQ."""
+        try:
+            if self._channel and self._channel.is_open:
+                self._channel.close()
+            if self._connection and self._connection.is_open:
+                self._connection.close()
+        except AMQPConnectionError as e:
+            raise MessageMiddlewareDisconnectedError from e
+        except AMQPError as e:
+            raise MessageMiddlewareCloseError from e

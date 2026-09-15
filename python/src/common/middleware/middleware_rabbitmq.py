@@ -2,6 +2,7 @@ import pika
 from pika.exceptions import AMQPConnectionError, AMQPError
 
 from .middleware import (
+    MessageMiddleware,
     MessageMiddlewareCloseError,
     MessageMiddlewareDisconnectedError,
     MessageMiddlewareExchange,
@@ -12,22 +13,8 @@ from .middleware import (
 EXCHANGE_TYPE = "topic"  # Tipo de exchange que se utilizará para la comunicación
 
 
-def _create_channel(host):
-    """Crea una conexión y un canal de comunicación con RabbitMQ."""
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
-    return connection, connection.channel()
-
-
-def _close_connection(connection, channel):
-    """Cierra el canal y la conexión de RabbitMQ si siguen abiertos."""
-    if channel.is_open:
-        _rabbitmq_call(channel.close, error=MessageMiddlewareCloseError)
-    if connection.is_open:
-        _rabbitmq_call(connection.close, error=MessageMiddlewareCloseError)
-
-
 def _rabbitmq_call(function, *args, error=MessageMiddlewareMessageError, **kwargs):
-    """Ejecuta una llamada a RabbitMQ y traduce sus errores."""
+    """Ejecuta una llamada a RabbitMQ y traduce sus errores a los del middleware."""
     try:
         return function(*args, **kwargs)
     except AMQPConnectionError as e:
@@ -38,6 +25,7 @@ def _rabbitmq_call(function, *args, error=MessageMiddlewareMessageError, **kwarg
 
 def _create_message_handler(on_message_callback):
     """Adapta el callback de RabbitMQ al callback del middleware."""
+
     def handle_message(channel, method, _properties, body):
         ack = lambda: channel.basic_ack(delivery_tag=method.delivery_tag)
         nack = lambda: channel.basic_nack(delivery_tag=method.delivery_tag)
@@ -46,36 +34,46 @@ def _create_message_handler(on_message_callback):
     return handle_message
 
 
-class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
-    def __init__(self, host, queue_name):
-        """Crea la conexión y declara la cola en RabbitMQ."""
+class _MessageMiddlewareRabbitMQ(MessageMiddleware):
+    """Base común para las variantes de cola y exchange sobre RabbitMQ.
+
+    Concentra el ciclo de vida compartido (conexión, consumo y cierre). Las
+    subclases solo aportan la declaración de la topología (cola o exchange)
+    y de qué cola consumen.
+    """
+
+    def __init__(self, host):
         self.host = host
-        self.queue_name = queue_name
         self.consumer_tag = None
 
-        self._connection, self._channel = _rabbitmq_call(_create_channel, self.host)
-        _rabbitmq_call(self._channel.queue_declare, queue=self.queue_name, durable=True)
+        self._connection, self._channel = _rabbitmq_call(self._create_channel, host)
+        try:
+            self._setup_topology()
+        except Exception:
+            # Si la declaración falla, se libera la conexión ya abierta
+            self.close()
+            raise
 
-    def send(self, message):
-        """Envía un mensaje a la cola asociada a esta instancia."""
-        _rabbitmq_call(
-            self._channel.basic_publish,
-            exchange="",
-            routing_key=self.queue_name,
-            body=message,
-        )
+    @staticmethod
+    def _create_channel(host):
+        """Crea una conexión y un canal de comunicación con RabbitMQ."""
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        return connection, connection.channel()
 
-    def start_consuming(self, on_message_callback):
-        """Inicia el consumo de mensajes de la cola asociada a esta instancia.
+    def _setup_topology(self):
+        """Declara la topología propia de cada subclase (cola o exchange)."""
+        raise NotImplementedError
 
-        `on_message_callback` debe aceptar tres argumentos: el cuerpo del mensaje, una función
-        para confirmar la recepción del mensaje (ack), y una función para rechazar el mensaje
-        (nack). Esto permite al consumidor decidir si el mensaje fue procesado correctamente o no.
+    def _consume_from(self, queue_name, on_message_callback):
+        """Inicia el consumo desde una cola concreta.
+
+        `on_message_callback` recibe tres argumentos: el cuerpo del mensaje, una
+        función para confirmarlo (ack) y otra para rechazarlo (nack). Así el
+        consumidor decide si el mensaje fue procesado correctamente o no.
         """
-
         self.consumer_tag = _rabbitmq_call(
             self._channel.basic_consume,
-            queue=self.queue_name,
+            queue=queue_name,
             on_message_callback=_create_message_handler(on_message_callback),
             auto_ack=False,
         )
@@ -89,18 +87,48 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             _rabbitmq_call(self._channel.stop_consuming)
 
     def close(self):
-        _close_connection(self._connection, self._channel)
+        """Cierra el canal y la conexión de RabbitMQ si siguen abiertos."""
+        if self._channel.is_open:
+            _rabbitmq_call(self._channel.close, error=MessageMiddlewareCloseError)
+        if self._connection.is_open:
+            _rabbitmq_call(self._connection.close, error=MessageMiddlewareCloseError)
 
 
-class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
+class MessageMiddlewareQueueRabbitMQ(
+    _MessageMiddlewareRabbitMQ, MessageMiddlewareQueue
+):
+    def __init__(self, host, queue_name):
+        """Crea la conexión y declara la cola en RabbitMQ."""
+        self.queue_name = queue_name
+        super().__init__(host)
+
+    def _setup_topology(self):
+        _rabbitmq_call(self._channel.queue_declare, queue=self.queue_name, durable=True)
+
+    def send(self, message):
+        """Envía un mensaje a la cola asociada a esta instancia."""
+        _rabbitmq_call(
+            self._channel.basic_publish,
+            exchange="",
+            routing_key=self.queue_name,
+            body=message,
+        )
+
+    def start_consuming(self, on_message_callback):
+        """Inicia el consumo de mensajes de la cola asociada a esta instancia."""
+        self._consume_from(self.queue_name, on_message_callback)
+
+
+class MessageMiddlewareExchangeRabbitMQ(
+    _MessageMiddlewareRabbitMQ, MessageMiddlewareExchange
+):
     def __init__(self, host, exchange_name, routing_keys):
-        """Crea la conexión y declara el exchange en RabbitMQ de tipo 'topic'."""
-        self.host = host
+        """Crea la conexión y declara el exchange en RabbitMQ"""
         self.exchange_name = exchange_name
         self.routing_keys = routing_keys
-        self.consumer_tag = None
+        super().__init__(host)
 
-        self._connection, self._channel = _rabbitmq_call(_create_channel, self.host)
+    def _setup_topology(self):
         _rabbitmq_call(
             self._channel.exchange_declare,
             exchange=self.exchange_name,
@@ -109,14 +137,17 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         )
 
     def send(self, message):
-        """Envía un mensaje al exchange con la routing key configurada."""
-        _rabbitmq_call(
-            self._channel.basic_publish,
-            exchange=self.exchange_name,
-            routing_key=self.routing_keys[0],
-            body=message,
-            properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent),
-        )
+        """Envía el mensaje al exchange una vez por cada routing key configurada."""
+        for routing_key in self.routing_keys:
+            _rabbitmq_call(
+                self._channel.basic_publish,
+                exchange=self.exchange_name,
+                routing_key=routing_key,
+                body=message,
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent
+                ),
+            )
 
     def start_consuming(self, on_message_callback):
         """Inicia el consumo de mensajes del exchange. Se crea una cola anónima
@@ -134,21 +165,4 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                 routing_key=routing_key,
             )
 
-        self.consumer_tag = _rabbitmq_call(
-            self._channel.basic_consume,
-            queue=queue_name,
-            on_message_callback=_create_message_handler(on_message_callback),
-            auto_ack=False,
-        )
-        _rabbitmq_call(self._channel.start_consuming)
-
-    def stop_consuming(self):
-        """Detiene el consumo de mensajes. Si no se está consumiendo, no hace nada."""
-        if self._channel.is_open and self.consumer_tag:
-            _rabbitmq_call(self._channel.basic_cancel, self.consumer_tag)
-            self.consumer_tag = None
-            _rabbitmq_call(self._channel.stop_consuming)
-
-    def close(self):
-        """Cierra la conexión y el canal de comunicación con RabbitMQ."""
-        _close_connection(self._connection, self._channel)
+        self._consume_from(queue_name, on_message_callback)
